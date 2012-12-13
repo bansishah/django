@@ -170,6 +170,15 @@ class GenericRelation(RelatedField, Field):
         qs = getattr(obj, self.name).all()
         return smart_unicode([instance._get_pk_val() for instance in qs])
 
+    def get_joining_columns(self, reverse_join=False):
+        join1_cols = ((self.m2m_target_field_name(), self.m2m_column_name()),)
+        join2_cols = ((self.m2m_reverse_name(), self.m2m_reverse_target_field_name()),)
+
+        if reverse_join:
+            raise ValueError('Reverse join is not supported on generic relations')
+
+        return (join1_cols, join2_cols)
+
     def m2m_db_table(self):
         return self.rel.to._meta.db_table
 
