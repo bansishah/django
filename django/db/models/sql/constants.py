@@ -21,9 +21,8 @@ TABLE_NAME = 0
 RHS_ALIAS = 1
 JOIN_TYPE = 2
 LHS_ALIAS = 3
-LHS_JOIN_COL = 4
-RHS_JOIN_COL = 5
-NULLABLE = 6
+JOIN_COLS = 4
+NULLABLE = 5
 
 # How many results to expect from a cursor.execute call
 MULTI = 'multi'
