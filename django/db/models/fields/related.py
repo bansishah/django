@@ -7,7 +7,7 @@ from django.db.models.fields import (AutoField, Field, IntegerField,
     PositiveIntegerField, PositiveSmallIntegerField, FieldDoesNotExist)
 from django.db.models.related import RelatedObject
 from django.db.models.query import QuerySet
-from django.db.models.query_utils import QueryWrapper
+from django.db.models.query_utils import Q, QueryWrapper
 from django.db.models.deletion import CASCADE
 from django.utils.encoding import smart_text
 from django.utils import six
@@ -91,6 +91,28 @@ def do_pending_lookups(sender, **kwargs):
 
 signals.class_prepared.connect(do_pending_lookups)
 
+def create_prefetch_query(query_field_name, related_fields, instances):
+    """
+    Creates a Q query object which dictates a prefetch query.
+    query_field_name: the foreign field of the model we have instances of. None means we are querying directly on the model
+    related_fields: the fields on that are related between to two models
+    instances: the instances to fetch the related objects for
+    """
+
+    prefix = '%s__' % (query_field_name) if query_field_name is not None else ''
+    query = Q()
+    if 1 == len(related_fields):
+        lh_field, rh_field = related_fields[0]
+        query_dict = {'%s%s__in' % (prefix, rh_field.name):
+                      set(getattr(instance, rh_field.attname) for instance in instances)}
+        query = Q(**query_dict)
+    else:
+        for instance in instances:
+            query_dict = {}
+            for lh_field, rh_field in related_fields:
+                query_dict['%s%s' % (prefix, rh_field.name)] = getattr(instance, rh_field.attname)
+            query |= Q(**query_dict)
+    return query
 
 #HACK
 class RelatedField(object):
@@ -247,8 +269,10 @@ class SingleRelatedObjectDescriptor(object):
         rel_obj_attr = attrgetter(self.related.field.attname)
         instance_attr = lambda obj: obj._get_pk_val()
         instances_dict = dict((instance_attr(inst), inst) for inst in instances)
-        params = {'%s__pk__in' % self.related.field.name: list(instances_dict)}
-        qs = self.get_query_set(instance=instances[0]).filter(**params)
+        query = create_prefetch_query(query_field_name=self.related.field.name,
+                                      related_fields=self.related.field.get_related_fields(),
+                                      instances=instances)
+        qs = self.get_query_set(instance=instances[0]).filter(query)
         # Since we're going to assign directly in the cache,
         # we must manage the reverse relation cache manually.
         rel_obj_cache_name = self.related.field.get_cache_name()
@@ -267,7 +291,9 @@ class SingleRelatedObjectDescriptor(object):
             if related_pk is None:
                 rel_obj = None
             else:
-                params = {'%s__pk' % self.related.field.name: related_pk}
+                params = {}
+                for lh_field, rh_field in self.related.field.get_related_fields():
+                    params['%s__%s' % (self.related.field.name, rh_field.name)] = getattr(instance, rh_field.attname)
                 try:
                     rel_obj = self.get_query_set(instance=instance).get(**params)
                 except self.related.model.DoesNotExist:
@@ -350,11 +376,10 @@ class ReverseSingleRelatedObjectDescriptor(object):
         rel_obj_attr = attrgetter(other_field.attname)
         instance_attr = attrgetter(self.field.attname)
         instances_dict = dict((instance_attr(inst), inst) for inst in instances)
-        if other_field.rel:
-            params = {'%s__pk__in' % self.field.rel.field_name: list(instances_dict)}
-        else:
-            params = {'%s__in' % self.field.rel.field_name: list(instances_dict)}
-        qs = self.get_query_set(instance=instances[0]).filter(**params)
+        query = create_prefetch_query(query_field_name=None,
+                                      related_fields=self.field.get_related_fields(),
+                                      instances=instances)
+        qs = self.get_query_set(instance=instances[0]).filter(query)
         # Since we're going to assign directly in the cache,
         # we must manage the reverse relation cache manually.
         if not self.field.rel.multiple:
@@ -374,11 +399,9 @@ class ReverseSingleRelatedObjectDescriptor(object):
             if val is None:
                 rel_obj = None
             else:
-                other_field = self.field.rel.get_related_field()
-                if other_field.rel:
-                    params = {'%s__%s' % (self.field.rel.field_name, other_field.rel.field_name): val}
-                else:
-                    params = {'%s__exact' % self.field.rel.field_name: val}
+                params = {}
+                for lh_field, rh_field in self.field.get_related_fields():
+                    params[rh_field.name] = getattr(instance, lh_field.attname)
                 qs = self.get_query_set(instance=instance)
                 # Assuming the database enforces foreign keys, this won't fail.
                 rel_obj = qs.get(**params)
@@ -486,9 +509,10 @@ class ForeignRelatedObjectsDescriptor(object):
             def __init__(self, instance):
                 super(RelatedManager, self).__init__()
                 self.instance = instance
-                self.core_filters = {
-                    '%s__%s' % (rel_field.name, attname): getattr(instance, attname)
-                }
+                self.core_filters = {}
+                for lh_field, rh_field in rel_field.get_related_fields():
+                    self.core_filters['%s__%s' % (rel_field.name, rh_field.attname)] = getattr(instance, rh_field.attname)
+
                 self.model = rel_model
 
             def get_query_set(self):
@@ -505,8 +529,10 @@ class ForeignRelatedObjectsDescriptor(object):
                 instance_attr = attrgetter(attname)
                 instances_dict = dict((instance_attr(inst), inst) for inst in instances)
                 db = self._db or router.db_for_read(self.model, instance=instances[0])
-                query = {'%s__%s__in' % (rel_field.name, attname): list(instances_dict)}
-                qs = super(RelatedManager, self).get_query_set().using(db).filter(**query)
+                query = create_prefetch_query(query_field_name=rel_field.name,
+                                              related_fields=rel_field.get_related_fields(),
+                                              instances=instances)
+                qs = super(RelatedManager, self).get_query_set().using(db).filter(query)
                 # Since we just bypassed this class' get_query_set(), we must manage
                 # the reverse relation manually.
                 for rel_obj in qs:
@@ -567,9 +593,17 @@ def create_many_related_manager(superclass, rel):
             super(ManyRelatedManager, self).__init__()
             self.model = model
             self.query_field_name = query_field_name
-            self.core_filters = {'%s__pk' % query_field_name: instance._get_pk_val()}
+
+            source_field = through._meta.get_field(source_field_name)
+            source_related_fields = source_field.get_related_fields()
+
+            self.core_filters = {}
+            for lh_field, rh_field in source_related_fields:
+                self.core_filters['%s__%s' % (query_field_name, rh_field.name)] = getattr(instance, rh_field.attname)
+
             self.instance = instance
             self.symmetrical = symmetrical
+            self.source_related_fields = source_related_fields
             self.source_field_name = source_field_name
             self.target_field_name = target_field_name
             self.reverse = reverse
@@ -612,9 +646,12 @@ def create_many_related_manager(superclass, rel):
             instance = instances[0]
             from django.db import connections
             db = self._db or router.db_for_read(instance.__class__, instance=instance)
-            query = {'%s__pk__in' % self.query_field_name:
-                         set(obj._get_pk_val() for obj in instances)}
-            qs = super(ManyRelatedManager, self).get_query_set().using(db)._next_is_sticky().filter(**query)
+
+            query = create_prefetch_query(query_field_name=self.query_field_name,
+                                          related_fields=self.source_related_fields,
+                                          instances=instances)
+
+            qs = super(ManyRelatedManager, self).get_query_set().using(db)._next_is_sticky().filter(query)
 
             # M2M: need to annotate the query in order to get the primary model
             # that the secondary model was actually related to. We know that
@@ -1020,6 +1057,25 @@ class ForeignKey(RelatedField, Field):
             raise exceptions.ValidationError(self.error_messages['invalid'] % {
                 'model': self.rel.to._meta.verbose_name, 'pk': value})
 
+    def get_joining_columns(self, reverse_join=False):
+        '''Returns a tuple of tuples containing columns that are equal when composing a join
+            i.e. ((col_1a, col_2a), (col_1b, col_2b)) means JOIN col_1a = col_2a AND col_1b = col_2b'''
+
+        joining_cols = []
+        for lh_field, rh_field in self.get_related_fields():
+            joining_cols.append((lh_field.column, rh_field.column))
+
+        # Swap column order if we are going a reverse join (i.e. (col_a, col_b) -> (col_b, col_a))
+        if reverse_join:
+            joining_cols = [tuple(reversed(pair)) for pair in joining_cols]
+
+        return tuple(joining_cols)
+
+    def get_related_fields(self):
+        '''Returns a list of tuples containing that fields that should match in the foriegn key relationship'''
+
+        return [(self, self.rel.get_related_field())]
+
     def get_attname(self):
         return '%s_id' % self.name
 
@@ -1198,6 +1254,24 @@ class ManyToManyField(RelatedField, Field):
         msg = _('Hold down "Control", or "Command" on a Mac, to select more than one.')
         self.help_text = string_concat(self.help_text, ' ', msg)
 
+    def get_joining_columns(self, reverse_join=False):
+        # Retrieves the joining information from the foreignkey
+        # column of the m2m table in which references this model
+        fk1 = self._get_foreign_key_reference(self.related)
+        fk1_join_cols = fk1.get_joining_columns()
+
+        # Retrieves the joining information from the foreignkey
+        # column of the m2m table that references the target model
+        fk2 = self._get_reverse_foreign_key_reference(self.related)
+        fk2_join_cols = fk2.get_joining_columns()
+
+        join1_cols = fk1_join_cols if not reverse_join else fk2_join_cols
+        join2_cols = fk2_join_cols if not reverse_join else fk1_join_cols
+
+        # Reverse join cols of 1st foreign key since we are going in reverse direction
+        join1_cols = tuple([tuple(reversed(col_pair)) for col_pair in join1_cols])
+        return (join1_cols, join2_cols)
+
     def get_choices_default(self):
         return Field.get_choices(self, include_blank=False)
 
@@ -1211,21 +1285,22 @@ class ManyToManyField(RelatedField, Field):
             return util.truncate_name('%s_%s' % (opts.db_table, self.name),
                                       connection.ops.max_name_length())
 
+    def _get_foreign_key_reference(self, related):
+        for f in self.rel.through._meta.fields:
+            if hasattr(f,'rel') and f.rel and f.rel.to == related.model:
+                return f
+        raise ValueError('Intermediate model does not have foreign key to model')
+
     def _get_m2m_attr(self, related, attr):
         "Function that can be curried to provide the source accessor or DB column name for the m2m table"
         cache_attr = '_m2m_%s_cache' % attr
         if hasattr(self, cache_attr):
             return getattr(self, cache_attr)
-        for f in self.rel.through._meta.fields:
-            if hasattr(f, 'rel') and f.rel and f.rel.to == related.model:
-                setattr(self, cache_attr, getattr(f, attr))
-                return getattr(self, cache_attr)
+        foreign_field = self._get_foreign_key_reference(related)
+        setattr(self, cache_attr, getattr(foreign_field, attr))
+        return getattr(self, cache_attr)
 
-    def _get_m2m_reverse_attr(self, related, attr):
-        "Function that can be curried to provide the related accessor or DB column name for the m2m table"
-        cache_attr = '_m2m_reverse_%s_cache' % attr
-        if hasattr(self, cache_attr):
-            return getattr(self, cache_attr)
+    def _get_reverse_foreign_key_reference(self, related):
         found = False
         for f in self.rel.through._meta.fields:
             if hasattr(f, 'rel') and f.rel and f.rel.to == related.parent_model:
@@ -1234,14 +1309,19 @@ class ManyToManyField(RelatedField, Field):
                     # the first foreign key you find will be
                     # the source column. Keep searching for
                     # the second foreign key.
-                    if found:
-                        setattr(self, cache_attr, getattr(f, attr))
-                        break
-                    else:
+                    if not found:
                         found = True
-                else:
-                    setattr(self, cache_attr, getattr(f, attr))
-                    break
+                        continue
+                return f
+        raise ValueError('Intermediate model does not have foreign key to model')
+
+    def _get_m2m_reverse_attr(self, related, attr):
+        "Function that can be curried to provide the related accessor or DB column name for the m2m table"
+        cache_attr = '_m2m_reverse_%s_cache' % attr
+        if hasattr(self, cache_attr):
+            return getattr(self, cache_attr)
+        foreign_field = self._get_reverse_foreign_key_reference(related)
+        setattr(self, cache_attr, getattr( foreign_field, attr))
         return getattr(self, cache_attr)
 
     def value_to_string(self, obj):

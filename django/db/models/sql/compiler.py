@@ -30,7 +30,7 @@ class SQLCompiler(object):
         # cleaned. We are not using a clone() of the query here.
         """
         if not self.query.tables:
-            self.query.join((None, self.query.model._meta.db_table, None, None))
+            self.query.join((None, self.query.model._meta.db_table, None))
         if (not self.query.select and self.query.default_cols and not
                 self.query.included_inherited_models):
             self.query.setup_inherited_models()
@@ -273,8 +273,9 @@ class SQLCompiler(object):
                     alias = seen[model]
                 except KeyError:
                     link_field = opts.get_ancestor_link(model)
+                    join_cols = link_field.get_joining_columns()
                     alias = self.query.join((start_alias, model._meta.db_table,
-                            link_field.column, model._meta.pk.column))
+                            join_cols))
                     seen[model] = alias
             else:
                 # If we're starting from the base model of the queryset, the
@@ -479,11 +480,16 @@ class SQLCompiler(object):
         if alias:
             while 1:
                 join = self.query.alias_map[alias]
-                if col != join.rhs_join_col:
+                found = False
+                for lh_col, rh_col in join.join_cols:
+                    if col == rh_col:
+                        found = True
+                        self.query.unref_alias(alias)
+                        alias = join.lhs_alias
+                        col = lh_col
+                        break
+                if not found:
                     break
-                self.query.unref_alias(alias)
-                alias = join.lhs_alias
-                col = join.lhs_join_col
         return col, alias
 
     def get_from_clause(self):
@@ -505,16 +511,23 @@ class SQLCompiler(object):
             if not self.query.alias_refcount[alias]:
                 continue
             try:
-                name, alias, join_type, lhs, lhs_col, col, nullable = self.query.alias_map[alias]
+                name, alias, join_type, lhs, join_cols, nullable = self.query.alias_map[alias]
             except KeyError:
                 # Extra tables can end up in self.tables, but not in the
                 # alias_map if they aren't in a join. That's OK. We skip them.
                 continue
             alias_str = (alias != name and ' %s' % alias or '')
             if join_type and not first:
-                result.append('%s %s%s ON (%s.%s = %s.%s)'
-                        % (join_type, qn(name), alias_str, qn(lhs),
-                           qn2(lhs_col), qn(alias), qn2(col)))
+                result.append('%s %s%s ON ('
+                        % (join_type, qn(name), alias_str))
+                first = True
+                for lhs_col, rhs_col in join_cols:
+                    if not first:
+                        result.append(' AND ')
+                    result.append('%s.%s = %s.%s' %
+                    (qn(lhs), qn2(lhs_col), qn(alias), qn2(rhs_col)))
+                    first = False
+                result.append(')')
             else:
                 connector = not first and ', ' or ''
                 result.append('%s%s%s' % (connector, qn(name), alias_str))
@@ -627,17 +640,18 @@ class SQLCompiler(object):
                     if not int_opts.parents[int_model]:
                         int_opts = int_model._meta
                         continue
-                    lhs_col = int_opts.parents[int_model].column
+                    lhs_field = int_opts.parents[int_model]
+                    lhs_col = lhs_field.column
                     int_opts = int_model._meta
-                    alias = self.query.join((alias, int_opts.db_table, lhs_col,
-                            int_opts.pk.column),
+                    join_cols = lhs_field.get_joining_columns()
+                    alias = self.query.join((alias, int_opts.db_table, join_cols),
                             promote=promote)
                     alias_chain.append(alias)
             else:
                 alias = root_alias
 
-            alias = self.query.join((alias, table, f.column,
-                    f.rel.get_related_field().column),
+            join_cols = f.get_joining_columns()
+            alias = self.query.join((alias, table, join_cols),
                     promote=promote)
             columns, aliases = self.get_default_columns(start_alias=alias,
                     opts=f.rel.to._meta, as_pairs=True)
@@ -676,15 +690,18 @@ class SQLCompiler(object):
                         if not int_opts.parents[int_model]:
                             int_opts = int_model._meta
                             continue
-                        lhs_col = int_opts.parents[int_model].column
+                        lhs_field = int_opts.parents[int_model]
+                        lhs_col = lhs_field.column
                         int_opts = int_model._meta
+                        join_cols = lhs_field.get_joining_columns()
                         alias = self.query.join(
-                            (alias, int_opts.db_table, lhs_col, int_opts.pk.column),
+                            (alias, int_opts.db_table, join_cols),
                             promote=True,
                         )
                         alias_chain.append(alias)
+                join_cols = f.get_joining_columns(reverse_join=True)
                 alias = self.query.join(
-                    (alias, table, f.rel.get_related_field().column, f.column),
+                    (alias, table, join_cols),
                     promote=True
                 )
                 from_parent = (opts.model if issubclass(model, opts.model)
