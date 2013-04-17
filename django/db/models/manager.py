@@ -59,12 +59,13 @@ class Manager(six.with_metaclass(RenameManagerMethods)):
     # Tracks each time a Manager instance is created. Used to retain order.
     creation_counter = 0
 
-    def __init__(self):
+    def __init__(self, query_set_class=QuerySet):
         super(Manager, self).__init__()
         self._set_creation_counter()
         self.model = None
         self._inherited = False
         self._db = None
+        self._query_set_class = query_set_class
 
     def contribute_to_class(self, model, name):
         # TODO: Use weakref because of possible memory leak / circular reference.
@@ -124,7 +125,7 @@ class Manager(six.with_metaclass(RenameManagerMethods)):
         """Returns a new QuerySet object.  Subclasses can override this method
         to easily customize the behavior of the Manager.
         """
-        return QuerySet(self.model, using=self._db)
+        return self._query_set_class(self.model, using=self._db)
 
     def none(self):
         return self.get_queryset().none()
